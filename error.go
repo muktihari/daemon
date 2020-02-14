@@ -17,6 +17,7 @@ type ErrDaemon struct {
 	Childs []error
 }
 
+// Error return error as string
 func (e *ErrDaemon) Error() string {
 	if len(e.Childs) != 0 {
 		return fmt.Sprintf("%s: %s", e.Parent, e.Childs)
@@ -24,6 +25,7 @@ func (e *ErrDaemon) Error() string {
 	return e.Parent.Error()
 }
 
+// Unwrap unwraps the error as Parent error
 func (e *ErrDaemon) Unwrap() error {
 	return e.Parent
 }

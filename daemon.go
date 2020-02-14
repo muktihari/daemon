@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muktihari/daemon/task"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -12,50 +14,52 @@ import (
 type Status string
 
 const (
-	//IsRunning is the status of running daemon.
+	// IsRunning is the status of running daemon.
 	IsRunning Status = "Daemon is Running"
 
-	//IsStopped is the status of stopped daemon.
+	// IsStopped is the status of stopped daemon.
 	IsStopped Status = "Daemon is Stopped"
 )
 
 // Daemon is the daemon interface.
 type Daemon interface {
 	// AddTask adds a number of tasks to be run by the daemon.
-	AddTask(...Task) Daemon
+	AddTask(name string, taskType task.Type, theTask task.Task) Daemon
 
-	// SetNumberOfWorker set number of workers (concurrent process).
-	SetNumberOfWorker(int) Daemon
+	// Workers set number of workers (concurrent process). default is 0, means workers is as many as the number of the tasks.
+	Workers(int) Daemon
 
-	// SetTaskRetryAfterFail set duration to wait before retry running the tasks.
-	SetTaskRetryAfterFail(time.Duration) Daemon
+	// RetryIn set duration to wait before retriable running the tasks.
+	RetryIn(time.Duration) Daemon
 
-	// UnsetTaskRetryAfterFail disables retry after fail
-	UnsetTaskRetryAfterFail() Daemon
+	// DoNotRetry disables retriable after fail
+	DoNotRetry() Daemon
 
-	// Run runs the daemon once then exit when done or when the context is returning context.DeadlineExceed or context.Canceled.
-	// It will run TaskTypeMandatorySync tasks before others, return immediately when error.
-	// Then run both TaskTypeSync and TaskTypeAsync tasks simultaneously by remaining available workers.
-	// While TaskTypeSync will be run in sequential order, the TaskTypeAsync will be run concurrently.
+	// Run executes the daemon once then exit when done or when the context is returning context.DeadlineExceed or context.Canceled.
+	// It will run MandatorySync tasks before others, return immediately when error.
+	// Then run MandatoryAsync before Sync and Async, return immediately when error.
+	// Finally run both Sync and Async tasks simultaneously by remaining available workers.
+	// While Sync will be run in sequential order, the Async will be run concurrently.
+	// Once daemon is set to IsRunning, all running tasks from RunATask will be waited until it's done before continue running the daemon.
+	// All new triggered tasks from RunATask will be waiting until the daemon is done, then will be run after that.
 	Run(context.Context) error
 
 	// RunWithInterval will call the Run function periodically based on the given time interval.
 	RunWithInterval(context.Context, time.Duration) error
 
-	// RunATask runs a single task once.
+	// RunATask executes a single task once. If daemon status is still running, it will be waiting until it finish.
 	RunATask(context.Context, string) error
 
-	// Stop stops the running daemon by giving the cancel signal for the given context.
-	// A task should listen to the context propagation to determine task's cancellation.
+	// Stop terminates the running daemon by giving the cancel signal for the given context, all task will be canceled.
 	Stop()
 
-	// StopATask stops a single running task by the given name.
+	// StopATask terminates a single running task by the given name.
 	StopATask(string)
 
 	// PostponeATask prevent task from being executed the next time Run is triggered
 	PostponeATask(string)
 
-	// PostponeATask resume postponed task to be executed the next time Run is triggered
+	// PostponeATask resumes postponed task to be executed the next time Run is triggered
 	ResumeATask(string)
 
 	// GetStatus gets the status of the daemon.
@@ -63,20 +67,43 @@ type Daemon interface {
 }
 
 type daemon struct {
-	mu                 sync.RWMutex
-	log                *log.Logger
-	ctx                context.Context
-	cancel             context.CancelFunc
-	nWorker            int
-	taskRetryAfterFail bool
-	taskRetryDuration  time.Duration
-	status             Status
-	tasks              []Task
+	mu            sync.RWMutex
+	log           *log.Logger
+	ctx           context.Context
+	cancel        context.CancelFunc
+	nWorker       int
+	retriable     bool
+	retryDuration time.Duration
+	status        Status
+	taskRunners   []taskRunner
 }
 
-// Result is result structure of the executed task by the worker
-type Result struct {
-	Task Task
+type taskRunner struct {
+	mu       sync.RWMutex
+	ctx      context.Context
+	cancel   context.CancelFunc
+	name     string
+	taskType task.Type
+	status   task.Status
+	task     task.Task
+}
+
+func (t *taskRunner) setContextCancellation(ctx context.Context) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.ctx, t.cancel = context.WithCancel(ctx)
+}
+
+func (t *taskRunner) setStatus(status task.Status) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.status = status
+}
+
+type result struct {
+	Task taskRunner
 	Err  error
 }
 
@@ -92,51 +119,56 @@ func New(loggers ...*log.Logger) Daemon {
 		})
 	}
 	return &daemon{
-		log:     loggers[0],
-		nWorker: 1,
+		log: loggers[0],
 	}
 }
 
-func (d *daemon) SetNumberOfWorker(n int) Daemon {
+func (d *daemon) Workers(n int) Daemon {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.nWorker = 1
-	if n > 1 {
+	d.nWorker = 0
+	if n > 0 {
 		d.nWorker = n
 	}
 	return d
 }
 
-func (d *daemon) SetTaskRetryAfterFail(duration time.Duration) Daemon {
+func (d *daemon) RetryIn(duration time.Duration) Daemon {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.taskRetryAfterFail = true
-	d.taskRetryDuration = duration
+	d.retriable = true
+	d.retryDuration = duration
 	return d
 }
 
-func (d *daemon) UnsetTaskRetryAfterFail() Daemon {
+func (d *daemon) DoNotRetry() Daemon {
 	d.mu.Lock()
-	d.taskRetryAfterFail = false
-	d.mu.Unlock()
+	defer d.mu.Unlock()
 
+	d.retriable = false
 	return d
 }
 
-func (d *daemon) AddTask(tasks ...Task) Daemon {
+func (d *daemon) AddTask(name string, taskType task.Type, theTask task.Task) Daemon {
 	d.mu.Lock()
-	d.tasks = append(d.tasks, tasks...)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+
+	d.taskRunners = append(d.taskRunners, taskRunner{
+		name:     name,
+		taskType: taskType,
+		task:     theTask,
+	})
 
 	return d
 }
 
 func (d *daemon) setContextCancellation(ctx context.Context) {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.ctx, d.cancel = context.WithCancel(ctx)
-	d.mu.Unlock()
 }
 
 func (d *daemon) Run(ctx context.Context) error {
@@ -144,27 +176,42 @@ func (d *daemon) Run(ctx context.Context) error {
 	d.setStatus(IsRunning)
 	defer d.Stop()
 
-	var mandatorySyncTasks, syncTasks, asyncTasks []Task
-	for _, task := range d.tasks {
-		if task.GetStatus() == TaskStatusIsPostponed {
-			continue
-		} else if task.GetType() == TaskTypeMandatorySync {
-			mandatorySyncTasks = append(mandatorySyncTasks, task)
-		} else if task.GetType() == TaskTypeSync {
-			syncTasks = append(syncTasks, task)
-		} else {
-			asyncTasks = append(asyncTasks, task)
+	for i := range d.taskRunners {
+		if d.taskRunners[i].status == task.IsRunning {
+			<-d.taskRunners[i].ctx.Done()
 		}
 	}
 
-	if err := d.runner(mandatorySyncTasks); err != nil {
+	var mandatorySyncTasks, mandatoryAsyncTasks, syncTasks, asyncTasks []taskRunner
+	for i := range d.taskRunners {
+		d.taskRunners[i].setContextCancellation(d.ctx)
+		if d.taskRunners[i].status == task.IsPostponed {
+			continue
+		} else if d.taskRunners[i].taskType == task.MandatorySync {
+			mandatorySyncTasks = append(mandatorySyncTasks, d.taskRunners[i])
+		} else if d.taskRunners[i].taskType == task.MandatoryAsync {
+			mandatoryAsyncTasks = append(mandatoryAsyncTasks, d.taskRunners[i])
+		} else if d.taskRunners[i].taskType == task.Sync {
+			syncTasks = append(syncTasks, d.taskRunners[i])
+		} else {
+			asyncTasks = append(asyncTasks, d.taskRunners[i])
+		}
+	}
+
+	for _, mandatorySyncTask := range mandatorySyncTasks {
+		if err := d.runner([]taskRunner{mandatorySyncTask}); err != nil {
+			return err
+		}
+	}
+
+	if err := d.runner(mandatoryAsyncTasks); err != nil {
 		return err
 	}
 
 	errCh := make(chan error, 1+len(syncTasks))
 	go func(errsCh chan<- error) {
-		for _, task := range syncTasks {
-			errsCh <- d.runner([]Task{task})
+		for i := range syncTasks {
+			errsCh <- d.runner([]taskRunner{syncTasks[i]})
 		}
 	}(errCh)
 
@@ -192,15 +239,15 @@ func (d *daemon) Run(ctx context.Context) error {
 	return nil
 }
 
-func (d *daemon) runner(tasks []Task) error {
+func (d *daemon) runner(tasks []taskRunner) error {
 	if len(tasks) == 0 {
 		return nil
 	}
-	taskCh := make(chan Task, len(tasks))
-	resultCh := make(chan Result, len(tasks))
+	taskCh := make(chan taskRunner, len(tasks))
+	resultCh := make(chan result, len(tasks))
 
 	nWorker := d.nWorker
-	if nWorker > len(tasks) {
+	if nWorker > len(tasks) || nWorker == 0 {
 		nWorker = len(tasks)
 	}
 
@@ -208,15 +255,17 @@ func (d *daemon) runner(tasks []Task) error {
 		go d.worker(taskCh, resultCh)
 	}
 
-	for _, task := range tasks {
-		taskCh <- task
+	for i := range tasks {
+		tasks[i].setStatus(task.IsRunning)
+		taskCh <- tasks[i]
 	}
 	close(taskCh)
 
-	var retryTasks []Task
+	var retryTasks []taskRunner
 	var errs []error
 	for i := 0; i < len(tasks); i++ {
 		result := <-resultCh
+		result.Task.setStatus(task.IsStopped)
 		if result.Err != nil {
 			retryTasks = append(retryTasks, result.Task)
 			errs = append(errs, result.Err)
@@ -225,7 +274,7 @@ func (d *daemon) runner(tasks []Task) error {
 	close(resultCh)
 
 	if len(retryTasks) != 0 {
-		if d.taskRetryAfterFail == false {
+		if d.retriable == false {
 			select {
 			case <-d.ctx.Done():
 				return &ErrDaemon{Parent: d.ctx.Err(), Childs: errs}
@@ -237,15 +286,15 @@ func (d *daemon) runner(tasks []Task) error {
 			d.log.Warn(err)
 		}
 
-		taskType := retryTasks[0].GetType()
+		taskType := retryTasks[0].taskType
 		if taskType == "" {
-			taskType = TaskTypeAsync
+			taskType = task.Async
 		}
-		d.log.Infof("[%s] fail %d of %d tasks, retrying...\n", taskType, len(retryTasks), len(tasks))
+		d.log.Infof("[%s] fail %d of %d tasks, retrying in %s...\n", taskType, len(retryTasks), len(tasks), d.retryDuration)
 		select {
 		case <-d.ctx.Done():
 			return &ErrDaemon{Parent: d.ctx.Err(), Childs: errs}
-		case <-time.After(d.taskRetryDuration):
+		case <-time.After(d.retryDuration):
 			return d.runner(retryTasks)
 		}
 	}
@@ -253,11 +302,11 @@ func (d *daemon) runner(tasks []Task) error {
 	return nil
 }
 
-func (d *daemon) worker(tasks <-chan Task, results chan<- Result) {
-	for task := range tasks {
-		results <- Result{
-			Task: task,
-			Err:  task.Run(d.ctx),
+func (d *daemon) worker(taskRunners <-chan taskRunner, results chan<- result) {
+	for tr := range taskRunners {
+		results <- result{
+			Task: tr,
+			Err:  tr.task.Run(tr.ctx),
 		}
 	}
 }
@@ -275,49 +324,62 @@ func (d *daemon) RunWithInterval(ctx context.Context, interval time.Duration) er
 		d.log.Infof("Completed in %v", time.Now().Sub(startTime))
 		d.log.Infof("Waiting")
 
-		<-ticker.C
+		select {
+		case <-d.ctx.Done():
+			return d.ctx.Err()
+		case <-ticker.C:
+			continue
+		}
 	}
 }
 
 func (d *daemon) RunATask(ctx context.Context, name string) error {
-	for _, task := range d.tasks {
-		if task.GetName() == name {
-			return task.Run(ctx)
+	select {
+	case <-d.ctx.Done():
+		for _, tr := range d.taskRunners {
+			if tr.name == name {
+				tr.setContextCancellation(ctx)
+				return tr.task.Run(tr.ctx)
+			}
 		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 func (d *daemon) Stop() {
 	if d.GetStatus() == IsRunning {
 		d.cancel()
 	}
-
 	d.setStatus(IsStopped)
 }
 
 func (d *daemon) StopATask(name string) {
-	for i := range d.tasks {
-		if d.tasks[i].GetName() == name {
-			d.tasks[i].Stop()
-			return
+	select {
+	case <-d.ctx.Done():
+		for i := range d.taskRunners {
+			if d.taskRunners[i].name == name {
+				d.taskRunners[i].cancel()
+				return
+			}
 		}
 	}
 }
 
 func (d *daemon) PostponeATask(name string) {
-	for i := range d.tasks {
-		if d.tasks[i].GetName() == name {
-			d.tasks[i].Postpone()
+	for i := range d.taskRunners {
+		if d.taskRunners[i].name == name {
+			d.taskRunners[i].setStatus(task.IsPostponed)
 			return
 		}
 	}
 }
 
 func (d *daemon) ResumeATask(name string) {
-	for i := range d.tasks {
-		if d.tasks[i].GetName() == name {
-			d.tasks[i].Resume()
+	for i := range d.taskRunners {
+		if d.taskRunners[i].name == name {
+			d.taskRunners[i].setStatus(task.IsStopped)
 			return
 		}
 	}
